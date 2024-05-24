@@ -190,10 +190,16 @@ int path_spec_fd_event(PathSpec *s, uint32_t revents) {
                 return log_error_errno(errno, "Failed to read inotify event: %m");
         }
 
-        if (IN_SET(s->type, PATH_CHANGED, PATH_MODIFIED))
+        if (IN_SET(s->type, PATH_CHANGED, PATH_MODIFIED)) {
                 FOREACH_INOTIFY_EVENT_WARN(e, buffer, l)
                         if (s->primary_wd == e->wd)
                                 return 1;
+        } else if (IN_SET(s->type, PATH_EXISTS, _PATH_TYPE_INVALID)) {
+                FOREACH_INOTIFY_EVENT_WARN(e, buffer, l)
+                        if (s->primary_wd == e->wd)  {
+                                return 2;
+                        }
+        }
 
         return 0;
 }
@@ -555,6 +561,12 @@ static void path_enter_running(Path *p, char *trigger_path) {
         path_set_state(p, PATH_RUNNING);
         path_unwatch(p);
 
+        /* Now that the file has been created, add it to the watcher */
+        LIST_FOREACH(spec, s, p->specs) {
+                if (s->type == PATH_EXISTS)
+                        path_spec_watch(s, path_dispatch_io);
+        }
+
         return;
 
 fail:
@@ -770,6 +782,9 @@ static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
         PathSpec *s = userdata, *found = NULL;
         Path *p;
         int changed;
+        Unit *trigger;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        int r;
 
         assert(s);
         assert(s->unit);
@@ -792,13 +807,34 @@ static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
         }
 
         changed = path_spec_fd_event(found, revents);
-        if (changed < 0)
-                goto fail;
 
-        if (changed)
-                path_enter_running(p, found->path);
-        else
+        switch (changed) {
+
+        case 0:
                 path_enter_waiting(p, false, false);
+                break;
+
+        case 1:
+                path_enter_running(p, found->path);
+                break;
+
+        case 2:
+                trigger = UNIT_TRIGGER(UNIT(p));
+                if (!trigger) {
+                        log_unit_error(UNIT(p), "Unit to trigger vanished.");
+                        goto fail;
+                }
+
+                r = manager_add_job(UNIT(p)->manager, JOB_STOP, trigger, JOB_REPLACE, NULL, &error, NULL);
+                if (r < 0) {
+                        log_unit_warning(UNIT(p), "Failed to queue unmount job: %s", bus_error_message(&error, r));
+                        goto fail;
+                }
+                break;
+
+        default:
+                goto fail;
+        }
 
         return 0;
 
